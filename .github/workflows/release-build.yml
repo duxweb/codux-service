@@ -1,0 +1,131 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build artifact
+        run: ./scripts/release/build.sh "${{ steps.version.outputs.value }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codux-service-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*.tar.gz*
+
+  docker:
+    name: Build And Publish Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/duxweb/codux-service
+          tags: |
+            type=raw,value=${{ steps.version.outputs.value }}
+            type=raw,value=latest
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
+
+  release:
+    name: Publish GitHub Release
+    needs: [build, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 *.tar.gz > SHA256SUMS.txt
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.value }}
+          name: Codux Service ${{ steps.version.outputs.value }}
+          body: |
+            Docker image:
+
+            ```bash
+            docker pull ghcr.io/duxweb/codux-service:${{ steps.version.outputs.value }}
+            ```
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/SHA256SUMS.txt

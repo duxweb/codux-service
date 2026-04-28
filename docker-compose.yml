@@ -1,0 +1,10 @@
+services:
+  codux-service:
+    image: ghcr.io/duxweb/codux-service:latest
+    container_name: codux-service
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./data:/data
+    command: ["-addr", ":8088", "-db", "/data/codux-service.sqlite3", "-pairing-ttl", "300"]
