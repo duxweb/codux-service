@@ -22,12 +22,14 @@ type createPairingRequest struct {
 }
 
 type createPairingResponse struct {
-	PairingID string    `json:"pairingId"`
-	Code      string    `json:"code"`
-	Secret    string    `json:"secret"`
-	HostName  string    `json:"hostName,omitempty"`
-	ExpiresAt time.Time `json:"expiresAt"`
-	QRPayload string    `json:"qrPayload"`
+	PairingID     string    `json:"pairingId"`
+	Code          string    `json:"code"`
+	Secret        string    `json:"secret"`
+	HostName      string    `json:"hostName,omitempty"`
+	HostPublicKey string    `json:"hostPublicKey,omitempty"`
+	CryptoVersion int       `json:"cryptoVersion,omitempty"`
+	ExpiresAt     time.Time `json:"expiresAt"`
+	QRPayload     string    `json:"qrPayload"`
 }
 
 type claimPairingRequest struct {
@@ -49,11 +51,17 @@ type pairingStatusRequest struct {
 }
 
 type pairingStatusResponse struct {
-	Status   string `json:"status"`
-	HostID   string `json:"hostId"`
-	HostName string `json:"hostName,omitempty"`
-	DeviceID string `json:"deviceId,omitempty"`
-	Token    string `json:"token,omitempty"`
+	Status          string `json:"status"`
+	PairingID       string `json:"pairingId,omitempty"`
+	HostID          string `json:"hostId"`
+	HostName        string `json:"hostName,omitempty"`
+	HostPublicKey   string `json:"hostPublicKey,omitempty"`
+	CryptoVersion   int    `json:"cryptoVersion,omitempty"`
+	Code            string `json:"code,omitempty"`
+	DeviceName      string `json:"deviceName,omitempty"`
+	DevicePublicKey string `json:"devicePublicKey,omitempty"`
+	DeviceID        string `json:"deviceId,omitempty"`
+	Token           string `json:"token,omitempty"`
 }
 
 type confirmPairingRequest struct {

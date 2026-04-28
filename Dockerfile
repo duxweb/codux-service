@@ -23,9 +23,10 @@ RUN apt-get update \
     && chown -R codux:codux /data /opt/codux-service
 
 COPY --from=builder /out/codux-service /usr/local/bin/codux-service
+COPY deploy/docker.toml /opt/codux-service/config.toml
 USER codux
 WORKDIR /opt/codux-service
 VOLUME ["/data"]
 EXPOSE 8088
 ENTRYPOINT ["/usr/local/bin/codux-service"]
-CMD ["-addr", ":8088", "-db", "/data/codux-service.sqlite3"]
+CMD ["-config", "/opt/codux-service/config.toml"]

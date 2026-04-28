@@ -189,7 +189,7 @@ func (d *DB) ConfirmPairing(ctx context.Context, pairingID string, device Device
 }
 
 func (d *DB) RejectPairing(ctx context.Context, hostID, pairingID string, at time.Time) error {
-	result, err := d.db.ExecContext(ctx, `UPDATE pairings SET status='rejected', confirmed_at=? WHERE host_id=? AND id=? AND status='claimed'`, millis(at), hostID, pairingID)
+	result, err := d.db.ExecContext(ctx, `UPDATE pairings SET status='rejected', confirmed_at=? WHERE host_id=? AND id=? AND status IN ('pending', 'claimed')`, millis(at), hostID, pairingID)
 	if err != nil {
 		return err
 	}

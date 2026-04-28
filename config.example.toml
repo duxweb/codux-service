@@ -1,0 +1,16 @@
+[server]
+# HTTP/WebSocket listen address.
+# Use "127.0.0.1:8088" for local-only binding or ":8088" for all interfaces.
+addr = ":8088"
+read_header_timeout_seconds = 10
+
+[database]
+path = "codux-service.sqlite3"
+
+[pairing]
+# Pairing QR lifetime.
+ttl_seconds = 300
+
+[shutdown]
+# Graceful shutdown timeout before force exit.
+timeout_seconds = 3

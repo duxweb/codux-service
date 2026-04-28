@@ -15,6 +15,7 @@ fi
 artifact="codux-service-${version}-${os_name}-${arch_name}"
 output="${out_dir}/${artifact}/${binary}"
 mkdir -p "$(dirname "${output}")"
+cp deploy/config.toml "${out_dir}/${artifact}/config.toml"
 
 CGO_ENABLED=1 go build \
   -trimpath \

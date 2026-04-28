@@ -69,12 +69,16 @@ func (h *Hub) Routes() http.Handler {
 }
 
 func (h *Hub) Close() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	peers := make([]*peer, 0, len(h.hosts)+len(h.clients))
 	for _, peer := range h.hosts {
-		peer.conn.Close(websocket.StatusGoingAway, "server shutting down")
+		peers = append(peers, peer)
 	}
 	for _, peer := range h.clients {
+		peers = append(peers, peer)
+	}
+	h.mu.RUnlock()
+	for _, peer := range peers {
 		peer.conn.Close(websocket.StatusGoingAway, "server shutting down")
 	}
 }
@@ -128,9 +132,20 @@ func (h *Hub) createPairing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, _ := h.store.HostByID(r.Context(), req.HostID)
-	payloadBytes, _ := json.Marshal(response{"server": publicBaseURL(r), "code": code, "secret": secret})
+	cryptoVersion := 1
+	if host.PublicKey == "" {
+		cryptoVersion = 0
+	}
+	payloadBytes, _ := json.Marshal(response{
+		"server":        publicBaseURL(r),
+		"code":          code,
+		"secret":        secret,
+		"hostName":      host.Name,
+		"hostPublicKey": host.PublicKey,
+		"cryptoVersion": cryptoVersion,
+	})
 	qrPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
-	writeJSON(w, http.StatusOK, createPairingResponse{PairingID: pairing.ID, Code: code, Secret: secret, HostName: host.Name, ExpiresAt: pairing.ExpiresAt, QRPayload: qrPayload})
+	writeJSON(w, http.StatusOK, createPairingResponse{PairingID: pairing.ID, Code: code, Secret: secret, HostName: host.Name, HostPublicKey: host.PublicKey, CryptoVersion: cryptoVersion, ExpiresAt: pairing.ExpiresAt, QRPayload: qrPayload})
 }
 
 func (h *Hub) claimPairing(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +180,21 @@ func (h *Hub) pairingStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, _ := h.store.HostByID(r.Context(), pairing.HostID)
-	res := pairingStatusResponse{Status: pairing.Status, HostID: pairing.HostID, HostName: host.Name}
+	cryptoVersion := 1
+	if host.PublicKey == "" {
+		cryptoVersion = 0
+	}
+	res := pairingStatusResponse{
+		Status:          pairing.Status,
+		PairingID:       pairing.ID,
+		HostID:          pairing.HostID,
+		HostName:        host.Name,
+		HostPublicKey:   host.PublicKey,
+		CryptoVersion:   cryptoVersion,
+		Code:            pairing.Code,
+		DeviceName:      pairing.DeviceName,
+		DevicePublicKey: pairing.DevicePublicKey,
+	}
 	if pairing.DeviceID != nil && pairing.Status == "confirmed" {
 		device, err := h.store.DeviceByID(r.Context(), *pairing.DeviceID)
 		if err == nil && device.RevokedAt == nil {
@@ -223,8 +252,8 @@ func (h *Hub) rejectPairing(w http.ResponseWriter, r *http.Request) {
 		writeErrorMessage(w, http.StatusNotFound, "pairing not found")
 		return
 	}
-	if pairing.Status != "claimed" {
-		writeErrorMessage(w, http.StatusConflict, "pairing is not claimed")
+	if pairing.Status != "pending" && pairing.Status != "claimed" {
+		writeErrorMessage(w, http.StatusConflict, "pairing is not pending or claimed")
 		return
 	}
 	now := time.Now().UTC()
@@ -378,7 +407,6 @@ func (h *Hub) pingLoop(ctx context.Context, p *peer) {
 
 func (h *Hub) registerPeer(p *peer) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if p.role == "host" {
 		if old := h.hosts[p.hostID]; old != nil {
 			old.conn.Close(websocket.StatusPolicyViolation, "replaced")
@@ -390,6 +418,8 @@ func (h *Hub) registerPeer(p *peer) {
 		}
 		h.clients[p.deviceID] = p
 	}
+	h.mu.Unlock()
+
 	h.logger.Info("peer connected", "role", p.role, "host", p.hostID, "device", p.deviceID)
 	if p.role == "client" {
 		h.sendToHost(p.hostID, envelope{Type: "device.connected", HostID: p.hostID, DeviceID: p.deviceID, Payload: mustJSON(response{"deviceId": p.deviceID}), At: time.Now().UnixMilli()})

@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/duxweb/codux-service/releases">
-    <img src="https://img.shields.io/badge/version-1.0.0-22d3ee?style=flat-square" alt="Version">
+    <img src="https://img.shields.io/badge/version-0.1.0-22d3ee?style=flat-square" alt="Version">
   </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square" alt="License">
@@ -41,37 +41,59 @@ Codux Service 是 Codux macOS 与 Codux Mobile 使用的轻量中继服务。它
 
 ## 安全模型
 
-Codux Service 是中继服务，不是端到端加密传输层。
+Codux Service 是中继服务。当前 Codux macOS/移动端会先对业务 payload 做端到端加密，再通过中继转发。
 
 - 生产环境请使用 **HTTPS/WSS**。TLS 可以保护 macOS/移动端到中继服务之间的网络传输，避免被网络旁路监听。
-- 当前服务端会终止 TLS，并在服务进程内以明文 JSON/WebSocket 消息转发。服务端运营者理论上可以看到终端输出、终端输入、文件内容、项目元数据、设备名称和配对状态。
-- 配对 secret 和设备 token 属于当前 host/relay 流程，服务端会参与生成/存储，因此公益服务器必须被视为可信基础设施。
-- 如果你提供公开/公益中继服务，需要明确告知用户这个信任边界，并保护服务器、数据库、日志和 TLS 私钥。
-- 真正的零信任公益服务器需要额外端到端加密：密钥只由 Codux macOS 和 Codux Mobile 生成和保存，服务端只转发密文。当前版本还没有实现这层能力。
+- 终端输出、终端输入、文件内容、项目列表和 AI 统计会封装为加密的 `secure.message`。中继只能看到 `hostId`、`deviceId`、消息类型、配对状态和在线状态等路由元数据。
+- 配对时会交换公钥，并在 macOS/移动端显示匹配码。如果 macOS 主机密钥变化，移动端必须重新配对。
+- 端侧会按 host/device 连接缓存派生后的对称密钥，正常业务消息只需要 AES-256-GCM 加解密和 JSON/base64 编解码，不会每条消息都跑 X25519/HKDF。
+- 配对 secret 和设备 token 仍会经过中继，因此仍要保护服务器、数据库、日志和 TLS 私钥。
+- 恶意中继仍然可以丢弃、延迟或重放流量，但没有端侧密钥就不能解密或伪造有效业务 payload。
 
-推荐方案：自建中继，或者使用你信任的服务提供方。若做公益服务器，建议尽量减少日志，并公开说明以上安全边界。
+推荐方案：使用 HTTPS/WSS，并尽量减少中继日志。若做公开/公益服务器，需要说明内容已端到端加密，但路由元数据对中继可见。
 
 ## 从源码运行
 
 ```bash
 go mod tidy
+cp config.example.toml config.toml
 go run ./cmd/codux-service
 ```
 
-监听端口可以自定义，下面两种方式等价：
+服务启动时会自动读取当前目录下的 `config.toml`。也可以显式指定配置文件：
 
 ```bash
-go run ./cmd/codux-service -addr :8088
-CODEX_SERVER_ADDR=:8088 go run ./cmd/codux-service
+go run ./cmd/codux-service -config ./config.toml
+CODEX_SERVICE_CONFIG=./config.toml go run ./cmd/codux-service
 ```
 
-运行参数：
+配置优先级为：命令行参数 → 环境变量 → TOML 配置 → 内置默认值。运行参数仍可用于临时覆盖：
 
-| 参数 | 环境变量 | 默认值 | 说明 |
-|:--|:--|:--|:--|
-| `-addr` | `CODEX_SERVER_ADDR` | `:8088` | HTTP/WebSocket 监听地址。`127.0.0.1:8088` 仅本机监听，`:8088` 监听所有网卡。 |
-| `-db` | `CODEX_SERVER_DB` | `codux-service.sqlite3` | SQLite 数据库路径。 |
-| `-pairing-ttl` | `CODEX_PAIRING_TTL` | `300` | 配对二维码有效期，单位秒。 |
+| 参数 | 环境变量 | TOML | 默认值 | 说明 |
+|:--|:--|:--|:--|:--|
+| `-config` | `CODEX_SERVICE_CONFIG` | — | `config.toml` | TOML 配置文件路径。默认 `config.toml` 不存在时会忽略；显式指定的路径必须存在。 |
+| `-addr` | `CODEX_SERVER_ADDR` | `server.addr` | `:8088` | HTTP/WebSocket 监听地址。`127.0.0.1:8088` 仅本机监听，`:8088` 监听所有网卡。 |
+| `-db` | `CODEX_SERVER_DB` | `database.path` | `codux-service.sqlite3` | SQLite 数据库路径。 |
+| `-pairing-ttl` | `CODEX_PAIRING_TTL` | `pairing.ttl_seconds` | `300` | 配对二维码有效期，单位秒。 |
+| `-shutdown-timeout` | `CODEX_SHUTDOWN_TIMEOUT` | `shutdown.timeout_seconds` | `3` | 优雅关闭超时时间，超过后强制退出，单位秒。 |
+| `-read-header-timeout` | `CODEX_READ_HEADER_TIMEOUT` | `server.read_header_timeout_seconds` | `10` | HTTP 请求头读取超时，单位秒。 |
+
+TOML 示例：
+
+```toml
+[server]
+addr = ":8088"
+read_header_timeout_seconds = 10
+
+[database]
+path = "/opt/codux-service/data/codux-service.sqlite3"
+
+[pairing]
+ttl_seconds = 300
+
+[shutdown]
+timeout_seconds = 3
+```
 
 ## 二进制部署
 
@@ -79,13 +101,11 @@ CODEX_SERVER_ADDR=:8088 go run ./cmd/codux-service
 
 ```bash
 mkdir -p /opt/codux-service/data
-tar -xzf codux-service-v1.0.0-linux-amd64.tar.gz
-sudo install -m 0755 codux-service-v1.0.0-linux-amd64/codux-service /usr/local/bin/codux-service
+tar -xzf codux-service-v0.1.0-linux-amd64.tar.gz
+sudo install -m 0755 codux-service-v0.1.0-linux-amd64/codux-service /usr/local/bin/codux-service
+sudo install -m 0644 codux-service-v0.1.0-linux-amd64/config.toml /opt/codux-service/config.toml
 
-codux-service \
-  -addr :8088 \
-  -db /opt/codux-service/data/codux-service.sqlite3 \
-  -pairing-ttl 300
+codux-service -config /opt/codux-service/config.toml
 ```
 
 防火墙放行对应端口后，在 Codux macOS 设置 → 远程 中填写：
@@ -117,7 +137,7 @@ docker run -d \
 docker compose up -d
 ```
 
-镜像默认把 SQLite 数据存储在 `/data/codux-service.sqlite3`。
+镜像默认读取 `/opt/codux-service/config.toml`，并把 SQLite 数据存储在 `/data/codux-service.sqlite3`。Compose 会挂载 `deploy/docker.toml`，让运行配置显式可见。
 
 ## 反向代理
 
@@ -187,9 +207,9 @@ docker build -t codux-service:dev .
 发布版本：
 
 ```bash
-git tag v1.0.0
+git tag v0.1.0
 git push origin main
-git push origin v1.0.0
+git push origin v0.1.0
 ```
 
 发布产物包括：

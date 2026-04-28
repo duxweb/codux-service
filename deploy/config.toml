@@ -1,0 +1,12 @@
+[server]
+addr = ":8088"
+read_header_timeout_seconds = 10
+
+[database]
+path = "/opt/codux-service/data/codux-service.sqlite3"
+
+[pairing]
+ttl_seconds = 300
+
+[shutdown]
+timeout_seconds = 3
