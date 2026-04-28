@@ -110,6 +110,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          pattern: codux-service-*
       - name: Generate checksums
         run: |
           cd dist
