@@ -53,6 +53,30 @@ func TestPairingRejectAndDeviceRevocationFlow(t *testing.T) {
 	if qr["hostPublicKey"] != "host-public-key" || qr["cryptoVersion"] != float64(1) {
 		t.Fatalf("expected qr payload to carry host crypto fields, got %#v", qr)
 	}
+	if qr["protocolVersion"] != "v3.0" {
+		t.Fatalf("expected v3 protocol in qr payload, got %#v", qr)
+	}
+	transports, ok := qr["transports"].([]any)
+	if !ok || len(transports) != 2 {
+		t.Fatalf("expected qr payload transports, got %#v", qr["transports"])
+	}
+	relay, _ := transports[0].(map[string]any)
+	webrtc, _ := transports[1].(map[string]any)
+	if relay["kind"] != "websocketRelay" || relay["url"] != server.URL {
+		t.Fatalf("expected websocket relay candidate, got %#v", relay)
+	}
+	if webrtc["kind"] != "webRtc" || webrtc["url"] != server.URL {
+		t.Fatalf("expected webrtc candidate, got %#v", webrtc)
+	}
+	iceServers, ok := webrtc["iceServers"].([]any)
+	if !ok || len(iceServers) != 1 {
+		t.Fatalf("expected webrtc ice servers, got %#v", webrtc["iceServers"])
+	}
+	iceServer, _ := iceServers[0].(map[string]any)
+	urls, ok := iceServer["urls"].([]any)
+	if !ok || len(urls) != 2 || urls[0] != "stun:stun.miwifi.com:3478" || urls[1] != "stun:stun.l.google.com:19302" {
+		t.Fatalf("unexpected ice server urls: %#v", iceServer["urls"])
+	}
 	post(t, server.URL, "/api/pairings/reject", map[string]any{
 		"hostId":    "host-1",
 		"token":     "host-token",

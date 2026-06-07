@@ -136,13 +136,22 @@ func (h *Hub) createPairing(w http.ResponseWriter, r *http.Request) {
 	if host.PublicKey == "" {
 		cryptoVersion = 0
 	}
+	serverURL := publicBaseURL(r)
+	stunURLs := []string{"stun:stun.miwifi.com:3478", "stun:stun.l.google.com:19302"}
 	payloadBytes, _ := json.Marshal(response{
-		"server":        publicBaseURL(r),
-		"code":          code,
-		"secret":        secret,
-		"hostName":      host.Name,
-		"hostPublicKey": host.PublicKey,
-		"cryptoVersion": cryptoVersion,
+		"code":            code,
+		"secret":          secret,
+		"pairingId":       pairing.ID,
+		"hostName":        host.Name,
+		"hostPublicKey":   host.PublicKey,
+		"cryptoVersion":   cryptoVersion,
+		"protocolVersion": "v3.0",
+		"transports": []response{
+			{"kind": "websocketRelay", "role": "host", "url": serverURL},
+			{"kind": "webRtc", "role": "host", "url": serverURL, "iceServers": []response{
+				{"urls": stunURLs},
+			}},
+		},
 	})
 	qrPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
 	writeJSON(w, http.StatusOK, createPairingResponse{PairingID: pairing.ID, Code: code, Secret: secret, HostName: host.Name, HostPublicKey: host.PublicKey, CryptoVersion: cryptoVersion, ExpiresAt: pairing.ExpiresAt, QRPayload: qrPayload})
