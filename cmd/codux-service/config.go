@@ -18,6 +18,9 @@ type runtimeConfig struct {
 	ConfigPath           string
 	Addr                 string
 	DBPath               string
+	StatsEnabled         bool
+	StatsPath            string
+	StatsFlushInterval   time.Duration
 	PairingTTL           time.Duration
 	ShutdownTimeout      time.Duration
 	ReadHeaderTimeout    time.Duration
@@ -33,6 +36,11 @@ type fileConfig struct {
 	Database struct {
 		Path string `toml:"path"`
 	} `toml:"database"`
+	Stats struct {
+		Enabled              *bool  `toml:"enabled"`
+		Path                 string `toml:"path"`
+		FlushIntervalSeconds *int   `toml:"flush_interval_seconds"`
+	} `toml:"stats"`
 	Pairing struct {
 		TTLSeconds *int `toml:"ttl_seconds"`
 	} `toml:"pairing"`
@@ -43,12 +51,15 @@ type fileConfig struct {
 
 func loadRuntimeConfig(args []string) (runtimeConfig, error) {
 	values := runtimeConfig{
-		ConfigPath:        env("CODEX_SERVICE_CONFIG", defaultConfigPath),
-		Addr:              ":8088",
-		DBPath:            "codux-service.sqlite3",
-		PairingTTL:        300 * time.Second,
-		ShutdownTimeout:   3 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
+		ConfigPath:         env("CODEX_SERVICE_CONFIG", defaultConfigPath),
+		Addr:               ":8088",
+		DBPath:             "codux-service.sqlite3",
+		StatsEnabled:       true,
+		StatsPath:          "codux-service.stats.jsonl",
+		StatsFlushInterval: 10 * time.Second,
+		PairingTTL:         300 * time.Second,
+		ShutdownTimeout:    3 * time.Second,
+		ReadHeaderTimeout:  10 * time.Second,
 	}
 
 	flagSet := flag.NewFlagSet("codux-service", flag.ContinueOnError)
@@ -56,6 +67,9 @@ func loadRuntimeConfig(args []string) (runtimeConfig, error) {
 	configPath := flagSet.String("config", values.ConfigPath, "TOML config file path")
 	addr := flagSet.String("addr", "", "HTTP/WebSocket listen address")
 	dbPath := flagSet.String("db", "", "SQLite database path")
+	statsEnabled := flagSet.Bool("stats", true, "enable relay statistics JSONL log")
+	statsPath := flagSet.String("stats-path", "", "relay statistics JSONL path")
+	statsFlushIntervalSeconds := flagSet.Int("stats-flush-interval", 0, "statistics snapshot interval in seconds")
 	pairingTTLSeconds := flagSet.Int("pairing-ttl", 0, "pairing QR lifetime in seconds")
 	shutdownTimeoutSeconds := flagSet.Int("shutdown-timeout", 0, "shutdown timeout in seconds")
 	readHeaderTimeoutSeconds := flagSet.Int("read-header-timeout", 0, "HTTP read header timeout in seconds")
@@ -85,6 +99,15 @@ func loadRuntimeConfig(args []string) (runtimeConfig, error) {
 	}
 	if explicitFlags["db"] {
 		values.DBPath = *dbPath
+	}
+	if explicitFlags["stats"] {
+		values.StatsEnabled = *statsEnabled
+	}
+	if explicitFlags["stats-path"] {
+		values.StatsPath = *statsPath
+	}
+	if explicitFlags["stats-flush-interval"] {
+		values.StatsFlushInterval = time.Duration(*statsFlushIntervalSeconds) * time.Second
 	}
 	if explicitFlags["pairing-ttl"] {
 		values.PairingTTL = time.Duration(*pairingTTLSeconds) * time.Second
@@ -116,6 +139,15 @@ func applyConfigFile(values *runtimeConfig, path string, required bool) (bool, e
 	if cfg.Database.Path != "" {
 		values.DBPath = cfg.Database.Path
 	}
+	if cfg.Stats.Enabled != nil {
+		values.StatsEnabled = *cfg.Stats.Enabled
+	}
+	if cfg.Stats.Path != "" {
+		values.StatsPath = cfg.Stats.Path
+	}
+	if cfg.Stats.FlushIntervalSeconds != nil {
+		values.StatsFlushInterval = time.Duration(*cfg.Stats.FlushIntervalSeconds) * time.Second
+	}
 	if cfg.Pairing.TTLSeconds != nil {
 		values.PairingTTL = time.Duration(*cfg.Pairing.TTLSeconds) * time.Second
 	}
@@ -135,6 +167,19 @@ func applyEnv(values *runtimeConfig) error {
 	if value := os.Getenv("CODEX_SERVER_DB"); value != "" {
 		values.DBPath = value
 	}
+	if value, ok, err := envBool("CODEX_STATS_ENABLED"); err != nil {
+		return err
+	} else if ok {
+		values.StatsEnabled = value
+	}
+	if value := os.Getenv("CODEX_STATS_PATH"); value != "" {
+		values.StatsPath = value
+	}
+	if value, ok, err := envDurationSeconds("CODEX_STATS_FLUSH_INTERVAL"); err != nil {
+		return err
+	} else if ok {
+		values.StatsFlushInterval = value
+	}
 	if value, ok, err := envDurationSeconds("CODEX_PAIRING_TTL"); err != nil {
 		return err
 	} else if ok {
@@ -151,6 +196,18 @@ func applyEnv(values *runtimeConfig) error {
 		values.ReadHeaderTimeout = value
 	}
 	return nil
+}
+
+func envBool(key string) (bool, bool, error) {
+	value := os.Getenv(key)
+	if value == "" {
+		return false, false, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, false, fmt.Errorf("%s must be a boolean value", key)
+	}
+	return parsed, true, nil
 }
 
 func envDurationSeconds(key string) (time.Duration, bool, error) {
@@ -179,6 +236,12 @@ func (c runtimeConfig) validate() error {
 	}
 	if c.DBPath == "" {
 		return fmt.Errorf("db path cannot be empty")
+	}
+	if c.StatsEnabled && c.StatsPath == "" {
+		return fmt.Errorf("stats path cannot be empty when stats are enabled")
+	}
+	if c.StatsEnabled && c.StatsFlushInterval <= 0 {
+		return fmt.Errorf("stats flush interval must be positive")
 	}
 	if c.PairingTTL <= 0 {
 		return fmt.Errorf("pairing ttl must be positive")

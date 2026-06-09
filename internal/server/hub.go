@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -21,38 +23,78 @@ import (
 )
 
 const (
-	websocketReadLimitBytes int64 = 32 << 20
-	websocketPingInterval         = 25 * time.Second
-	websocketPongTimeout          = 10 * time.Second
+	websocketReadLimitBytes       int64 = 32 << 20
+	websocketRelayMaxMessageBytes int64 = 1 << 20
+	websocketRelayBurstLimit            = 120
+	websocketPingInterval               = 25 * time.Second
+	websocketPongTimeout                = 10 * time.Second
+	websocketRateWindow                 = 10 * time.Second
+	ticketTTL                           = 60 * time.Second
+	ticketPayloadMaxBytes         int64 = 64 << 10
+	ticketMaxEntries                    = 4096
 )
 
 type Hub struct {
 	store      *store.DB
 	logger     *slog.Logger
+	stats      *StatsRecorder
 	pairingTTL time.Duration
 	mu         sync.RWMutex
 	hosts      map[string]*peer
 	clients    map[string]*peer
+	tickets    map[string]ticketEntry
+}
+
+type ticketEntry struct {
+	payload   json.RawMessage
+	expiresAt time.Time
 }
 
 type peer struct {
-	id       string
-	hostID   string
-	deviceID string
-	role     string
-	conn     *websocket.Conn
-	send     chan envelope
-	closed   chan struct{}
+	id        string
+	hostID    string
+	deviceID  string
+	role      string
+	stateless bool
+	conn      *websocket.Conn
+	send      chan envelope
+	closed    chan struct{}
+	rate      relayRate
+}
+
+type relayRate struct {
+	windowStart time.Time
+	count       int
 }
 
 func NewHub(database *store.DB, logger *slog.Logger, pairingTTL time.Duration) *Hub {
-	return &Hub{store: database, logger: logger, pairingTTL: pairingTTL, hosts: map[string]*peer{}, clients: map[string]*peer{}}
+	return &Hub{store: database, logger: logger, pairingTTL: pairingTTL, hosts: map[string]*peer{}, clients: map[string]*peer{}, tickets: map[string]ticketEntry{}}
+}
+
+func (h *Hub) SetStatsRecorder(stats *StatsRecorder) {
+	h.stats = stats
 }
 
 func (h *Hub) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(cors)
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, response{"ok": true}) })
+	h.mountProtocolRoutes(r)
+	r.Route("/v3", h.mountV3Routes)
+	return r
+}
+
+func (h *Hub) mountV3Routes(r chi.Router) {
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, response{"ok": true, "protocolVersion": "v3.0"})
+	})
+	r.Post("/api/tickets", h.createTicket)
+	r.Get("/api/tickets/{ticket}", h.getTicket)
+	r.Get("/ws/host", h.v3HostSocket)
+	r.Get("/ws/client", h.v3ClientSocket)
+}
+
+func (h *Hub) mountProtocolRoutes(r chi.Router) {
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/hosts/register", h.registerHost)
 		r.Post("/pairings", h.createPairing)
@@ -65,7 +107,6 @@ func (h *Hub) Routes() http.Handler {
 	})
 	r.Get("/ws/host", h.hostSocket)
 	r.Get("/ws/client", h.clientSocket)
-	return r
 }
 
 func (h *Hub) Close() {
@@ -136,7 +177,7 @@ func (h *Hub) createPairing(w http.ResponseWriter, r *http.Request) {
 	if host.PublicKey == "" {
 		cryptoVersion = 0
 	}
-	serverURL := publicBaseURL(r)
+	serverURL := publicProtocolBaseURL(r)
 	stunURLs := []string{"stun:stun.miwifi.com:3478", "stun:stun.l.google.com:19302"}
 	payloadBytes, _ := json.Marshal(response{
 		"code":            code,
@@ -155,6 +196,62 @@ func (h *Hub) createPairing(w http.ResponseWriter, r *http.Request) {
 	})
 	qrPayload := base64.RawURLEncoding.EncodeToString(payloadBytes)
 	writeJSON(w, http.StatusOK, createPairingResponse{PairingID: pairing.ID, Code: code, Secret: secret, HostName: host.Name, HostPublicKey: host.PublicKey, CryptoVersion: cryptoVersion, ExpiresAt: pairing.ExpiresAt, QRPayload: qrPayload})
+}
+
+func (h *Hub) createTicket(w http.ResponseWriter, r *http.Request) {
+	payload, err := io.ReadAll(http.MaxBytesReader(w, r.Body, ticketPayloadMaxBytes))
+	if err != nil {
+		writeErrorMessage(w, http.StatusRequestEntityTooLarge, "ticket payload is too large")
+		return
+	}
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || !json.Valid(payload) {
+		writeErrorMessage(w, http.StatusBadRequest, "ticket payload must be valid json")
+		return
+	}
+	ticket, err := crypto.Token(12)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(ticketTTL)
+	h.mu.Lock()
+	h.pruneExpiredTicketsLocked(now)
+	if len(h.tickets) >= ticketMaxEntries {
+		h.mu.Unlock()
+		writeErrorMessage(w, http.StatusTooManyRequests, "too many active tickets")
+		return
+	}
+	h.tickets[ticket] = ticketEntry{payload: append(json.RawMessage(nil), payload...), expiresAt: expiresAt}
+	h.mu.Unlock()
+	writeJSON(w, http.StatusOK, response{"ticket": ticket, "expiresAt": expiresAt})
+}
+
+func (h *Hub) getTicket(w http.ResponseWriter, r *http.Request) {
+	ticket := strings.TrimSpace(chi.URLParam(r, "ticket"))
+	now := time.Now().UTC()
+	h.mu.Lock()
+	h.pruneExpiredTicketsLocked(now)
+	entry, ok := h.tickets[ticket]
+	if !ok || entry.expiresAt.Before(now) {
+		delete(h.tickets, ticket)
+		h.mu.Unlock()
+		writeErrorMessage(w, http.StatusNotFound, "ticket not found or expired")
+		return
+	}
+	h.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(entry.payload)
+}
+
+func (h *Hub) pruneExpiredTicketsLocked(now time.Time) {
+	for ticket, entry := range h.tickets {
+		if !entry.expiresAt.After(now) {
+			delete(h.tickets, ticket)
+		}
+	}
 }
 
 func (h *Hub) claimPairing(w http.ResponseWriter, r *http.Request) {
@@ -344,6 +441,41 @@ func (h *Hub) clientSocket(w http.ResponseWriter, r *http.Request) {
 	h.runPeer(r.Context(), peer)
 }
 
+func (h *Hub) v3HostSocket(w http.ResponseWriter, r *http.Request) {
+	hostID := strings.TrimSpace(r.URL.Query().Get("hostId"))
+	if hostID == "" {
+		http.Error(w, "missing hostId", http.StatusBadRequest)
+		return
+	}
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	conn.SetReadLimit(websocketReadLimitBytes)
+	peer := newPeer(hostID, hostID, "", "host", conn)
+	peer.stateless = true
+	h.registerPeer(peer)
+	h.runPeer(r.Context(), peer)
+}
+
+func (h *Hub) v3ClientSocket(w http.ResponseWriter, r *http.Request) {
+	hostID := strings.TrimSpace(r.URL.Query().Get("hostId"))
+	deviceID := strings.TrimSpace(r.URL.Query().Get("deviceId"))
+	if hostID == "" || deviceID == "" {
+		http.Error(w, "missing hostId or deviceId", http.StatusBadRequest)
+		return
+	}
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if err != nil {
+		return
+	}
+	conn.SetReadLimit(websocketReadLimitBytes)
+	peer := newPeer(deviceID, hostID, deviceID, "client", conn)
+	peer.stateless = true
+	h.registerPeer(peer)
+	h.runPeer(r.Context(), peer)
+}
+
 func (h *Hub) runPeer(ctx context.Context, p *peer) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -357,16 +489,28 @@ func (h *Hub) runPeer(ctx context.Context, p *peer) {
 			break
 		}
 		msg.At = time.Now().UnixMilli()
+		size := relayMessageSize(msg)
+		if h.stats != nil {
+			h.stats.RecordMessage(p, msg, size)
+		}
+		if !h.allowRelayMessage(p, msg, size) {
+			continue
+		}
 		if p.role == "host" {
 			if msg.DeviceID != "" {
-				h.sendToClient(msg.DeviceID, msg)
+				if h.sendToClient(msg.DeviceID, msg) && h.stats != nil {
+					h.stats.RecordForwarded(p, msg, 1)
+				}
 			} else {
-				h.broadcastToHostClients(p.hostID, msg)
+				sent := h.broadcastToHostClients(p.hostID, msg)
+				if h.stats != nil {
+					h.stats.RecordForwarded(p, msg, sent)
+				}
 			}
 		} else {
 			msg.HostID = p.hostID
 			msg.DeviceID = p.deviceID
-			if msg.Type == "device.info" {
+			if !p.stateless && msg.Type == "device.info" {
 				var payload struct {
 					Name string `json:"name"`
 				}
@@ -374,11 +518,65 @@ func (h *Hub) runPeer(ctx context.Context, p *peer) {
 					_ = h.store.UpdateDeviceName(context.Background(), p.deviceID, strings.TrimSpace(payload.Name), time.Now().UTC())
 				}
 			}
-			h.sendToHost(p.hostID, msg)
+			if h.sendToHost(p.hostID, msg) && h.stats != nil {
+				h.stats.RecordForwarded(p, msg, 1)
+			}
 		}
 	}
 	h.unregisterPeer(p)
 	p.conn.Close(websocket.StatusNormalClosure, "closed")
+}
+
+func (h *Hub) allowRelayMessage(p *peer, msg envelope, size int64) bool {
+	now := time.Now()
+	if !p.rate.windowStart.IsZero() && now.Sub(p.rate.windowStart) < websocketRateWindow {
+		p.rate.count++
+	} else {
+		p.rate.windowStart = now
+		p.rate.count = 1
+	}
+	if p.rate.count > websocketRelayBurstLimit {
+		h.logger.Warn("relay message rate limited", "role", p.role, "host", p.hostID, "device", p.deviceID, "type", msg.Type)
+		if h.stats != nil {
+			h.stats.RecordDropped(p, msg, "rate_limited", size)
+		}
+		sendPeer(p, envelope{Type: "relay.error", HostID: p.hostID, DeviceID: p.deviceID, Error: "rate_limited", At: now.UnixMilli()})
+		return false
+	}
+	if size > websocketRelayMaxMessageBytes {
+		h.logger.Warn("relay message too large", "role", p.role, "host", p.hostID, "device", p.deviceID, "type", msg.Type)
+		if h.stats != nil {
+			h.stats.RecordDropped(p, msg, "message_too_large", size)
+		}
+		sendPeer(p, envelope{Type: "relay.error", HostID: p.hostID, DeviceID: p.deviceID, Error: "message_too_large", At: now.UnixMilli()})
+		return false
+	}
+	if isRelayUploadMessage(msg.Type) {
+		h.logger.Warn("relay upload blocked", "role", p.role, "host", p.hostID, "device", p.deviceID, "type", msg.Type)
+		if h.stats != nil {
+			h.stats.RecordDropped(p, msg, "upload_requires_p2p", size)
+		}
+		sendPeer(p, envelope{Type: "relay.error", HostID: p.hostID, DeviceID: p.deviceID, Error: "upload_requires_p2p", At: now.UnixMilli()})
+		return false
+	}
+	return true
+}
+
+func relayMessageSize(msg envelope) int64 {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return websocketRelayMaxMessageBytes + 1
+	}
+	return int64(len(data))
+}
+
+func isRelayUploadMessage(messageType string) bool {
+	switch messageType {
+	case "terminal.upload", "terminal.upload.start", "terminal.upload.chunk", "terminal.upload.finish", "file.write":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Hub) writeLoop(ctx context.Context, p *peer) {
@@ -430,6 +628,9 @@ func (h *Hub) registerPeer(p *peer) {
 	h.mu.Unlock()
 
 	h.logger.Info("peer connected", "role", p.role, "host", p.hostID, "device", p.deviceID)
+	if h.stats != nil {
+		h.stats.RecordConnect(p)
+	}
 	if p.role == "client" {
 		h.sendToHost(p.hostID, envelope{Type: "device.connected", HostID: p.hostID, DeviceID: p.deviceID, Payload: mustJSON(response{"deviceId": p.deviceID}), At: time.Now().UnixMilli()})
 	}
@@ -449,6 +650,9 @@ func (h *Hub) unregisterPeer(p *peer) {
 	h.mu.Unlock()
 	if removed {
 		h.logger.Info("peer disconnected", "role", p.role, "host", p.hostID, "device", p.deviceID)
+		if h.stats != nil {
+			h.stats.RecordDisconnect(p)
+		}
 		if p.role == "client" {
 			h.sendToHost(p.hostID, envelope{Type: "device.disconnected", HostID: p.hostID, DeviceID: p.deviceID, Payload: mustJSON(response{"deviceId": p.deviceID}), At: time.Now().UnixMilli()})
 		}
@@ -563,6 +767,13 @@ func publicBaseURL(r *http.Request) string {
 		scheme = forwarded
 	}
 	return fmt.Sprintf("%s://%s", scheme, r.Host)
+}
+func publicProtocolBaseURL(r *http.Request) string {
+	base := publicBaseURL(r)
+	if strings.HasPrefix(r.URL.Path, "/v3/") || r.URL.Path == "/v3" {
+		return base + "/v3"
+	}
+	return base
 }
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

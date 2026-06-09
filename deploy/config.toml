@@ -5,6 +5,11 @@ read_header_timeout_seconds = 10
 [database]
 path = "/opt/codux-service/data/codux-service.sqlite3"
 
+[stats]
+enabled = true
+path = "/opt/codux-service/data/codux-service.stats.jsonl"
+flush_interval_seconds = 10
+
 [pairing]
 ttl_seconds = 300
 

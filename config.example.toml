@@ -7,6 +7,12 @@ read_header_timeout_seconds = 10
 [database]
 path = "codux-service.sqlite3"
 
+[stats]
+# Side-channel JSONL relay statistics. This does not participate in protocol state.
+enabled = true
+path = "codux-service.stats.jsonl"
+flush_interval_seconds = 10
+
 [pairing]
 # Pairing QR lifetime.
 ttl_seconds = 300

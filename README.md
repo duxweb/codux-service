@@ -74,6 +74,9 @@ Configuration priority is: command-line flags → environment variables → TOML
 | `-config` | `CODEX_SERVICE_CONFIG` | — | `config.toml` | TOML config file path. Missing default `config.toml` is ignored; explicit paths must exist. |
 | `-addr` | `CODEX_SERVER_ADDR` | `server.addr` | `:8088` | HTTP/WebSocket listen address. Use `127.0.0.1:8088` for local-only binding or `:8088` for all interfaces. |
 | `-db` | `CODEX_SERVER_DB` | `database.path` | `codux-service.sqlite3` | SQLite database path. |
+| `-stats` | `CODEX_STATS_ENABLED` | `stats.enabled` | `true` | Enable side-channel JSONL relay statistics. This does not participate in protocol state. |
+| `-stats-path` | `CODEX_STATS_PATH` | `stats.path` | `codux-service.stats.jsonl` | Relay statistics JSONL path. |
+| `-stats-flush-interval` | `CODEX_STATS_FLUSH_INTERVAL` | `stats.flush_interval_seconds` | `10` | Statistics snapshot interval, in seconds. |
 | `-pairing-ttl` | `CODEX_PAIRING_TTL` | `pairing.ttl_seconds` | `300` | Pairing QR lifetime in seconds. |
 | `-shutdown-timeout` | `CODEX_SHUTDOWN_TIMEOUT` | `shutdown.timeout_seconds` | `3` | Graceful shutdown timeout before force exit, in seconds. |
 | `-read-header-timeout` | `CODEX_READ_HEADER_TIMEOUT` | `server.read_header_timeout_seconds` | `10` | HTTP read-header timeout, in seconds. |
@@ -87,6 +90,11 @@ read_header_timeout_seconds = 10
 
 [database]
 path = "/opt/codux-service/data/codux-service.sqlite3"
+
+[stats]
+enabled = true
+path = "/opt/codux-service/data/codux-service.stats.jsonl"
+flush_interval_seconds = 10
 
 [pairing]
 ttl_seconds = 300

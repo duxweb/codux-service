@@ -31,6 +31,16 @@ func main() {
 	defer database.Close()
 
 	hub := server.NewHub(database, logger, config.PairingTTL)
+	var stats *server.StatsRecorder
+	if config.StatsEnabled {
+		stats, err = server.NewStatsRecorder(config.StatsPath, config.StatsFlushInterval, logger)
+		if err != nil {
+			logger.Error("open stats log failed", "path", config.StatsPath, "error", err)
+			os.Exit(1)
+		}
+		defer stats.Close()
+		hub.SetStatsRecorder(stats)
+	}
 	httpServer := &http.Server{
 		Addr:              config.Addr,
 		Handler:           hub.Routes(),
@@ -42,6 +52,9 @@ func main() {
 			"codux relay listening",
 			"addr", config.Addr,
 			"db", config.DBPath,
+			"stats", config.StatsEnabled,
+			"stats_path", config.StatsPath,
+			"stats_flush_interval", config.StatsFlushInterval.String(),
 			"pairing_ttl", config.PairingTTL.String(),
 			"config", config.ConfigLoadedFromPath,
 			"version", version,

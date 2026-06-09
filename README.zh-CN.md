@@ -74,6 +74,9 @@ CODEX_SERVICE_CONFIG=./config.toml go run ./cmd/codux-service
 | `-config` | `CODEX_SERVICE_CONFIG` | — | `config.toml` | TOML 配置文件路径。默认 `config.toml` 不存在时会忽略；显式指定的路径必须存在。 |
 | `-addr` | `CODEX_SERVER_ADDR` | `server.addr` | `:8088` | HTTP/WebSocket 监听地址。`127.0.0.1:8088` 仅本机监听，`:8088` 监听所有网卡。 |
 | `-db` | `CODEX_SERVER_DB` | `database.path` | `codux-service.sqlite3` | SQLite 数据库路径。 |
+| `-stats` | `CODEX_STATS_ENABLED` | `stats.enabled` | `true` | 启用旁路 JSONL 中继统计，不参与协议状态。 |
+| `-stats-path` | `CODEX_STATS_PATH` | `stats.path` | `codux-service.stats.jsonl` | 中继统计 JSONL 文件路径。 |
+| `-stats-flush-interval` | `CODEX_STATS_FLUSH_INTERVAL` | `stats.flush_interval_seconds` | `10` | 统计快照写入间隔，单位秒。 |
 | `-pairing-ttl` | `CODEX_PAIRING_TTL` | `pairing.ttl_seconds` | `300` | 配对二维码有效期，单位秒。 |
 | `-shutdown-timeout` | `CODEX_SHUTDOWN_TIMEOUT` | `shutdown.timeout_seconds` | `3` | 优雅关闭超时时间，超过后强制退出，单位秒。 |
 | `-read-header-timeout` | `CODEX_READ_HEADER_TIMEOUT` | `server.read_header_timeout_seconds` | `10` | HTTP 请求头读取超时，单位秒。 |
@@ -87,6 +90,11 @@ read_header_timeout_seconds = 10
 
 [database]
 path = "/opt/codux-service/data/codux-service.sqlite3"
+
+[stats]
+enabled = true
+path = "/opt/codux-service/data/codux-service.stats.jsonl"
+flush_interval_seconds = 10
 
 [pairing]
 ttl_seconds = 300

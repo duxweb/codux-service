@@ -10,12 +10,58 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/duxweb/codux-service/internal/store"
 	"nhooyr.io/websocket"
 )
+
+func TestV3TicketStoresArbitraryJSONForShortPairingQR(t *testing.T) {
+	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	hub := NewHub(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Minute)
+	server := httptest.NewServer(hub.Routes())
+	t.Cleanup(server.Close)
+
+	payload := map[string]any{
+		"protocolVersion": "v3.0",
+		"nested":          map[string]any{"value": "kept"},
+		"items":           []any{1, "two", true},
+	}
+	created := post(t, server.URL, "/v3/api/tickets", payload)
+	ticket, ok := created["ticket"].(string)
+	if !ok || ticket == "" {
+		t.Fatalf("expected ticket, got %#v", created)
+	}
+	got := get(t, server.URL+"/v3/api/tickets/"+url.QueryEscape(ticket))
+	if got["protocolVersion"] != "v3.0" {
+		t.Fatalf("expected stored payload, got %#v", got)
+	}
+	if nested := got["nested"].(map[string]any); nested["value"] != "kept" {
+		t.Fatalf("expected arbitrary nested payload, got %#v", got)
+	}
+
+	hub.mu.Lock()
+	hub.tickets[ticket] = ticketEntry{payload: hub.tickets[ticket].payload, expiresAt: time.Now().UTC().Add(-time.Second)}
+	hub.mu.Unlock()
+	response, err := http.Get(server.URL + "/v3/api/tickets/" + url.QueryEscape(ticket))
+	if err != nil {
+		t.Fatalf("get expired ticket: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected expired ticket 404, got %d", response.StatusCode)
+	}
+}
 
 func TestPairingRejectAndDeviceRevocationFlow(t *testing.T) {
 	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
@@ -161,6 +207,85 @@ func TestPairingRejectAndDeviceRevocationFlow(t *testing.T) {
 	}
 }
 
+func TestLegacyRootRoutesRemainAvailable(t *testing.T) {
+	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	hub := NewHub(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Minute)
+	server := httptest.NewServer(hub.Routes())
+	t.Cleanup(server.Close)
+
+	post(t, server.URL, "/api/hosts/register", map[string]any{
+		"hostId": "host-legacy",
+		"name":   "Mac",
+		"token":  "host-token",
+	})
+	pairing := post(t, server.URL, "/api/pairings", map[string]any{
+		"hostId": "host-legacy",
+		"token":  "host-token",
+	})
+	qr := decodeQRPayload(t, pairing["qrPayload"].(string))
+	transports, ok := qr["transports"].([]any)
+	if !ok || len(transports) == 0 {
+		t.Fatalf("expected qr payload transports, got %#v", qr["transports"])
+	}
+	relay, _ := transports[0].(map[string]any)
+	if relay["url"] != server.URL {
+		t.Fatalf("expected legacy route to advertise root relay url, got %#v", relay)
+	}
+}
+
+func TestV3RoutesUseStatelessRelay(t *testing.T) {
+	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	hub := NewHub(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Minute)
+	server := httptest.NewServer(hub.Routes())
+	t.Cleanup(server.Close)
+
+	response, err := http.Post(server.URL+"/v3/api/hosts/register", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatalf("post v3 api: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected v3 api to stay disabled, got %d", response.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	hostConn, _, err := websocket.Dial(ctx, websocketURL(t, server.URL, "/v3/ws/host?hostId=host-v3"), nil)
+	if err != nil {
+		t.Fatalf("dial v3 host websocket: %v", err)
+	}
+	t.Cleanup(func() { hostConn.Close(websocket.StatusNormalClosure, "test done") })
+	clientConn, _, err := websocket.Dial(ctx, websocketURL(t, server.URL, "/v3/ws/client?hostId=host-v3&deviceId=device-v3"), nil)
+	if err != nil {
+		t.Fatalf("dial v3 client websocket: %v", err)
+	}
+	t.Cleanup(func() { clientConn.Close(websocket.StatusNormalClosure, "test done") })
+
+	readEnvelope(t, hostConn)
+	readEnvelope(t, clientConn)
+	readEnvelope(t, hostConn)
+	writeEnvelope(t, clientConn, envelope{Type: "pairing.request", Payload: mustJSON(map[string]any{"pairingId": "pair-1"})})
+	message := readEnvelope(t, hostConn)
+	if message.Type != "pairing.request" || message.HostID != "host-v3" || message.DeviceID != "device-v3" {
+		t.Fatalf("expected stateless pairing request relay, got %#v", message)
+	}
+	writeEnvelope(t, hostConn, envelope{Type: "pairing.confirmed", DeviceID: "device-v3", Payload: mustJSON(map[string]any{"deviceId": "device-v3"})})
+	message = readEnvelope(t, clientConn)
+	if message.Type != "pairing.confirmed" || message.DeviceID != "device-v3" {
+		t.Fatalf("expected stateless pairing confirmation relay, got %#v", message)
+	}
+}
+
 func TestDeviceListReturnsWhileHostAndClientAreConnected(t *testing.T) {
 	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
 	if err != nil {
@@ -217,6 +342,212 @@ func TestDeviceListReturnsWhileHostAndClientAreConnected(t *testing.T) {
 	if device["online"] != true {
 		t.Fatalf("expected connected device to be online, got %#v", device)
 	}
+}
+
+func TestRelayBlocksUploadMessages(t *testing.T) {
+	server, hostConn, clientConn := connectedRelayPair(t)
+	_ = server
+	readEnvelope(t, hostConn)
+	readEnvelope(t, clientConn)
+	readEnvelope(t, hostConn)
+
+	writeEnvelope(t, clientConn, envelope{Type: "terminal.upload.start", Payload: mustJSON(map[string]any{"name": "large.bin"})})
+	errorMessage := readEnvelope(t, clientConn)
+	if errorMessage.Type != "relay.error" || errorMessage.Error != "upload_requires_p2p" {
+		t.Fatalf("expected upload relay error, got %#v", errorMessage)
+	}
+	ensureNoEnvelope(t, hostConn, 100*time.Millisecond)
+}
+
+func TestRelayBlocksOversizedMessages(t *testing.T) {
+	server, hostConn, clientConn := connectedRelayPair(t)
+	_ = server
+	readEnvelope(t, hostConn)
+	readEnvelope(t, clientConn)
+	readEnvelope(t, hostConn)
+
+	payload := bytes.Repeat([]byte("x"), int(websocketRelayMaxMessageBytes)+1)
+	writeEnvelope(t, clientConn, envelope{Type: "secure.message", Payload: jsonRawMessage(strconv.Quote(string(payload)))})
+	errorMessage := readEnvelope(t, clientConn)
+	if errorMessage.Type != "relay.error" || errorMessage.Error != "message_too_large" {
+		t.Fatalf("expected oversized relay error, got %#v", errorMessage)
+	}
+	ensureNoEnvelope(t, hostConn, 100*time.Millisecond)
+}
+
+func TestRelayRateLimitsMessages(t *testing.T) {
+	server, hostConn, clientConn := connectedRelayPair(t)
+	_ = server
+	readEnvelope(t, hostConn)
+	readEnvelope(t, clientConn)
+	readEnvelope(t, hostConn)
+
+	for i := 0; i < websocketRelayBurstLimit+1; i++ {
+		writeEnvelope(t, clientConn, envelope{Type: "terminal.input", ID: strconv.Itoa(i), Payload: mustJSON(map[string]any{"data": "x"})})
+	}
+	for i := 0; i < websocketRelayBurstLimit; i++ {
+		message := readEnvelope(t, hostConn)
+		if message.Type != "terminal.input" {
+			t.Fatalf("expected forwarded input, got %#v", message)
+		}
+	}
+	errorMessage := readEnvelope(t, clientConn)
+	if errorMessage.Type != "relay.error" || errorMessage.Error != "rate_limited" {
+		t.Fatalf("expected rate limit relay error, got %#v", errorMessage)
+	}
+}
+
+func TestStatsRecorderWritesRelayEvents(t *testing.T) {
+	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	statsPath := filepath.Join(t.TempDir(), "stats.jsonl")
+	stats, err := NewStatsRecorder(statsPath, time.Hour, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("open stats recorder: %v", err)
+	}
+
+	hub := NewHub(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Minute)
+	hub.SetStatsRecorder(stats)
+	server := httptest.NewServer(hub.Routes())
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	hostConn, _, err := websocket.Dial(ctx, websocketURL(t, server.URL, "/v3/ws/host?hostId=host-stats"), nil)
+	if err != nil {
+		t.Fatalf("dial v3 host websocket: %v", err)
+	}
+	clientConn, _, err := websocket.Dial(ctx, websocketURL(t, server.URL, "/v3/ws/client?hostId=host-stats&deviceId=device-stats"), nil)
+	if err != nil {
+		t.Fatalf("dial v3 client websocket: %v", err)
+	}
+
+	readEnvelope(t, hostConn)
+	readEnvelope(t, clientConn)
+	readEnvelope(t, hostConn)
+	writeEnvelope(t, clientConn, envelope{Type: "terminal.upload.start", Payload: mustJSON(map[string]any{"name": "large.bin"})})
+	readEnvelope(t, clientConn)
+	clientConn.Close(websocket.StatusNormalClosure, "test done")
+	hostConn.Close(websocket.StatusNormalClosure, "test done")
+	if err := stats.Close(); err != nil {
+		t.Fatalf("close stats recorder: %v", err)
+	}
+
+	data, err := os.ReadFile(statsPath)
+	if err != nil {
+		t.Fatalf("read stats log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) < 4 {
+		t.Fatalf("expected relay stats events, got %q", string(data))
+	}
+	if !strings.Contains(string(data), `"event":"connect"`) {
+		t.Fatalf("expected connect event, got %q", string(data))
+	}
+	if !strings.Contains(string(data), `"event":"drop"`) || !strings.Contains(string(data), `"reason":"upload_requires_p2p"`) {
+		t.Fatalf("expected upload drop event, got %q", string(data))
+	}
+	if !strings.Contains(string(data), `"event":"snapshot"`) || !strings.Contains(string(data), `"uploadBlockedTotal":1`) {
+		t.Fatalf("expected snapshot counters, got %q", string(data))
+	}
+}
+
+func connectedRelayPair(t *testing.T) (*httptest.Server, *websocket.Conn, *websocket.Conn) {
+	t.Helper()
+	database, err := store.Open(t.TempDir() + "/codux-service.sqlite3")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	hub := NewHub(database, slog.New(slog.NewTextHandler(io.Discard, nil)), 5*time.Minute)
+	server := httptest.NewServer(hub.Routes())
+	t.Cleanup(server.Close)
+
+	post(t, server.URL, "/api/hosts/register", map[string]any{
+		"hostId": "host-1",
+		"name":   "Mac",
+		"token":  "host-token",
+	})
+	pairing := post(t, server.URL, "/api/pairings", map[string]any{
+		"hostId": "host-1",
+		"token":  "host-token",
+	})
+	post(t, server.URL, "/api/pairings/claim", map[string]any{
+		"code":   pairing["code"],
+		"secret": pairing["secret"],
+		"name":   "Phone",
+	})
+	confirmed := post(t, server.URL, "/api/pairings/confirm", map[string]any{
+		"hostId":    "host-1",
+		"token":     "host-token",
+		"pairingId": pairing["pairingId"],
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	hostConn, _, err := websocket.Dial(ctx, websocketURL(t, server.URL, "/ws/host?hostId=host-1&token=host-token"), nil)
+	if err != nil {
+		t.Fatalf("dial host websocket: %v", err)
+	}
+	t.Cleanup(func() { hostConn.Close(websocket.StatusNormalClosure, "test done") })
+	clientConn, _, err := websocket.Dial(
+		ctx,
+		websocketURL(t, server.URL, "/ws/client?deviceId="+url.QueryEscape(confirmed["deviceId"].(string))+"&token="+url.QueryEscape(confirmed["token"].(string))),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("dial client websocket: %v", err)
+	}
+	t.Cleanup(func() { clientConn.Close(websocket.StatusNormalClosure, "test done") })
+	return server, hostConn, clientConn
+}
+
+func writeEnvelope(t *testing.T, conn *websocket.Conn, message envelope) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := wsjsonWrite(ctx, conn, message); err != nil {
+		t.Fatalf("write envelope: %v", err)
+	}
+}
+
+func readEnvelope(t *testing.T, conn *websocket.Conn) envelope {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var message envelope
+	if err := wsjsonRead(ctx, conn, &message); err != nil {
+		t.Fatalf("read envelope: %v", err)
+	}
+	return message
+}
+
+func ensureNoEnvelope(t *testing.T, conn *websocket.Conn, timeout time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var message envelope
+	if err := wsjsonRead(ctx, conn, &message); err == nil {
+		t.Fatalf("expected no envelope, got %#v", message)
+	}
+}
+
+func decodeQRPayload(t *testing.T, payload string) map[string]any {
+	t.Helper()
+	qrData, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		t.Fatalf("decode qr payload: %v", err)
+	}
+	var qr map[string]any
+	if err := json.Unmarshal(qrData, &qr); err != nil {
+		t.Fatalf("decode qr json: %v", err)
+	}
+	return qr
 }
 
 func post(t *testing.T, baseURL string, path string, body map[string]any) map[string]any {
